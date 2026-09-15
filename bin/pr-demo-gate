@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# pr-demo-gate <owner/repo> <pr-number>
+#
+# Refuse to call a pull request merge-ready when its issue asked for a demo and
+# nobody ran one.
+#
+# The incident behind it: a lookup against a government tax API went through
+# three review rounds, three verify rounds, 36 new tests and a detailed
+# deployment section, merged clean, and shipped completely dead. Its parser
+# required a field the API does not send, and every fixture invented that field,
+# so the suite was green about a response shape that has never existed. The pull
+# request had zero comments. One real call would have shown it on day one, and
+# the written convention had described the demo gate in detail the whole time.
+#
+# The lesson is not "remember the demo". Tests can only assert what the author
+# believed; a demo is the only step that asks the outside world. A gate written
+# in prose loses to a busy cycle, so this one is code.
+#
+# What counts as evidence: a '## Demo' heading in the pull request body, or a
+# comment on the pull request whose first heading is a Demo one. Deliberately
+# shallow. It cannot tell a real demo from a fake one and does not try. It
+# catches the case that actually happens, which is nobody running one at all.
+#
+# Exit 0 = demo evidence found, or the issue asked for none
+#      1 = the issue defines a Demo and the pull request carries no evidence
+#      2 = usage, or the pull request cannot be read
+set -uo pipefail
+
+[[ $# -eq 2 ]] || { echo "usage: pr-demo-gate <owner/repo> <pr-number>" >&2; exit 2; }
+REPO="$1"; PR="$2"
+
+body=$(gh pr view "$PR" --repo "$REPO" --json body --jq .body 2>/dev/null) || {
+  echo "FAIL: cannot read pull request $REPO#$PR" >&2; exit 2; }
+
+# Which issue does this pull request close? The demo is defined on the ISSUE,
+# or on its plan comment, not on the pull request. Writing it before the build
+# is the whole point: it is the acceptance criterion, not a receipt.
+issue=$(grep -oiE '(closes|fixes|resolves) +#([0-9]+)' <<<"$body" | grep -oE '[0-9]+' | head -1)
+if [[ -z "$issue" ]]; then
+  echo "SKIP: ${REPO}#${PR} closes no issue, so there is no demo contract to check."
+  exit 0
+fi
+
+# The issue body, plus every comment on it, since a planning step often posts
+# the '## Demo' block as a comment rather than editing the body.
+issue_text=$(gh issue view "$issue" --repo "$REPO" --json body --jq .body 2>/dev/null)
+issue_text+=$'\n'$(gh api "repos/${REPO}/issues/${issue}/comments?per_page=100" --jq '.[].body' 2>/dev/null)
+
+if ! grep -qiE '^#+ *demo' <<<"$issue_text"; then
+  echo "SKIP: ${REPO}#${issue} has no Demo section, so there is nothing to verify."
+  exit 0
+fi
+
+if grep -qiE '^#+ *demo' <<<"$body"; then
+  echo "OK: ${REPO}#${PR} carries a Demo section in the pull request body."
+  exit 0
+fi
+
+pr_comments=$(gh api "repos/${REPO}/issues/${PR}/comments?per_page=100" --jq '.[].body' 2>/dev/null)
+if grep -qiE '^#+ *demo' <<<"$pr_comments"; then
+  echo "OK: ${REPO}#${PR} has a Demo comment."
+  exit 0
+fi
+
+cat <<MSG
+BLOCKED: ${REPO}#${issue} defines a Demo and ${REPO}#${PR} carries no demo evidence.
+  - run the issue's Demo against a build of THIS branch and post the real
+    output as a pull request comment, or as a '## Demo' section in the body
+  - tests assert what the author believed. The demo is the only step that asks
+    the outside world whether the assumption behind the code was ever true.
+MSG
+exit 1

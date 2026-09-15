@@ -1,0 +1,46 @@
+name: guard
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck every script
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck bin/*
+
+      - name: No private infrastructure in a public repo
+        # Checks for CLASSES of leak, never for a list of host names. A deny-list
+        # of the names you are trying to hide publishes those names, which is the
+        # own goal this job exists to prevent. Keep any name-specific check in the
+        # private repo that has the names in it.
+        run: |
+          fail=0
+          check() {
+            if grep -rInE "$1" bin/ README.md; then
+              echo "::error::$2"
+              fail=1
+            fi
+          }
+          check '/(Users|home)/[a-z]' 'absolute home directory path'
+          check '\.ts\.net|\.tailnet|100\.([6-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+' 'tailnet host or address'
+          check '\b(10|192\.168)\.[0-9]+\.[0-9]+\.[0-9]+' 'private IP address'
+          check '^[^#]*\bssh +[a-z][a-z0-9_-]+ ' 'ssh to a named host'
+          check '[A-Za-z0-9+/]{32,}={0,2}["'"'"']' 'possible embedded credential'
+          exit $fail
+
+      - name: Scripts run and print usage
+        run: |
+          for s in bin/*; do
+            out="$("$s" 2>&1 || true)"
+            case "$out" in
+              usage:*) echo "ok $s" ;;
+              *) echo "::error::$s did not print usage with no arguments"; exit 1 ;;
+            esac
+          done

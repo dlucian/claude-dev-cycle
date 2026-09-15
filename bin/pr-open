@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# pr-open <owner/repo> <issue-number> [--draft] [--skipped-findings <file>]
+#
+# Push the current branch and open a pull request for it, late in the cycle,
+# after the review rounds have already run locally.
+#
+# Opening the pull request last is a cost control, not a tidiness preference.
+# Continuous integration and hosted review bots trigger on pull request, and
+# Copilot re-reviews and re-bills the full diff on every push. A pull request
+# opened before the review rounds spends build minutes and review budget
+# grading code no reviewer has read yet.
+#
+# Prints the pull request URL on stdout.
+#
+# Exit 0 = pull request opened · 1 = refused or failed · 2 = usage
+set -euo pipefail
+
+usage() {
+  echo "usage: pr-open <owner/repo> <issue-number> [--draft] [--skipped-findings <file>]" >&2
+  exit 2
+}
+
+[ $# -ge 2 ] || usage
+REPO="$1"
+ISSUE="$2"
+shift 2
+
+DRAFT=0
+SKIPPED_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --draft) DRAFT=1; shift ;;
+    --skipped-findings) SKIPPED_FILE="${2:-}"; [ -n "$SKIPPED_FILE" ] || usage; shift 2 ;;
+    *) usage ;;
+  esac
+done
+
+# Labels are optional. Set them to your own scheme, or leave them empty to skip
+# the relabel entirely. A repo without these labels is not an error.
+LABEL_FROM="${PR_OPEN_LABEL_FROM:-state: in-progress}"
+LABEL_TO="${PR_OPEN_LABEL_TO:-state: in-review}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)"
+
+# Ask the forge for the default branch rather than assuming main or master.
+BASE="$(gh repo view "$REPO" --json defaultBranchRef --jq .defaultBranchRef.name)"
+[ -n "$BASE" ] || { echo "pr-open: cannot read the default branch of $REPO" >&2; exit 1; }
+
+if [ "$BRANCH" = "$BASE" ]; then
+  echo "pr-open: refuse to open a pull request from $BASE" >&2
+  exit 1
+fi
+
+TITLE="$(gh issue view "$ISSUE" --repo "$REPO" --json title --jq .title)"
+
+BODY_FILE="$(mktemp -t pr-open.XXXXXX)"
+trap 'rm -f "$BODY_FILE"' EXIT
+{
+  echo "Closes #${ISSUE}."
+  echo
+  # Findings the review rounds raised and you consciously declined belong in
+  # the pull request, not in a chat log. A reader who disagrees can then see
+  # what you decided and why.
+  if [ -n "$SKIPPED_FILE" ] && [ -s "$SKIPPED_FILE" ]; then
+    echo "## Review findings skipped (out of scope)"
+    echo
+    cat "$SKIPPED_FILE"
+    echo
+  fi
+} > "$BODY_FILE"
+
+git -C "$REPO_ROOT" push -u origin "$BRANCH" --quiet
+
+ARGS=(pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$BODY_FILE")
+[ "$DRAFT" = "1" ] && ARGS+=(--draft)
+PR_URL="$(gh "${ARGS[@]}")"
+
+if [ -n "$LABEL_FROM" ] || [ -n "$LABEL_TO" ]; then
+  LABEL_ARGS=(issue edit "$ISSUE" --repo "$REPO")
+  [ -n "$LABEL_FROM" ] && LABEL_ARGS+=(--remove-label "$LABEL_FROM")
+  [ -n "$LABEL_TO" ] && LABEL_ARGS+=(--add-label "$LABEL_TO")
+  gh "${LABEL_ARGS[@]}" >/dev/null 2>&1 || true
+fi
+
+echo "$PR_URL"

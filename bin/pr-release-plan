@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# pr-release-plan <owner/repo> <pr-number>
+#
+# Refuse to call a pull request merge-ready when it hides an operator step.
+#
+# The incident behind it: a pull request introduced an OPTIONAL environment
+# variable and documented it in three files, every place except the one an
+# operator reads at deploy time. It passed a verify pass, four review rounds, a
+# final review and a set of pre-merge checks, merged clean, deployed clean, and
+# then ran with half the feature silently inert because nobody set the variable.
+# The repo's own convention had required a Release plan section since the
+# previous day. Nothing enforced it.
+#
+# The lesson is not "remember the release plan". It is that a merged pull
+# request is not a deployed one, no reviewer can see that gap, and the gap has
+# to be checked by something that cannot forget.
+#
+# Exit 0 = clean · 1 = missing release plan or undocumented operator step · 2 = usage
+set -uo pipefail
+
+[[ $# -eq 2 ]] || { echo "usage: pr-release-plan <owner/repo> <pr-number>" >&2; exit 2; }
+REPO="$1"; PR="$2"
+
+body=$(gh pr view "$PR" --repo "$REPO" --json body --jq .body 2>/dev/null) || {
+  echo "FAIL: cannot read pull request $REPO#$PR" >&2; exit 1; }
+diff=$(gh pr diff "$PR" --repo "$REPO" 2>/dev/null) || diff=""
+
+fail=0
+note() { echo "  - $1"; }
+
+# 1. Does this repo require a release plan at all? Its own agent instructions
+#    are the authority, so the gate reads them rather than carrying a policy.
+CONVENTION_FILE="${RELEASE_PLAN_CONVENTION_FILE:-CLAUDE.md}"
+requires=0
+if gh api "repos/${REPO}/contents/${CONVENTION_FILE}" --jq '.content' 2>/dev/null \
+     | base64 -d 2>/dev/null | grep -qi '## Release plan'; then
+  requires=1
+fi
+
+has_plan=0
+grep -qiE '^#+ *Release plan' <<<"$body" && has_plan=1
+
+if [[ $requires -eq 1 && $has_plan -eq 0 ]]; then
+  echo "BLOCKED: ${REPO}#${PR} has no Release plan section, but ${REPO}/${CONVENTION_FILE} requires one."
+  fail=1
+fi
+
+# 2. Operator steps the diff proves exist, whether or not the repo asks for a
+#    plan. An environment variable added to an example file is a deploy-time
+#    action by definition.
+#
+#    Scoped to environment-template files on purpose. An earlier version scanned
+#    every added line in the diff for a `NAME=` shape, which made any ordinary
+#    shell assignment inside a changed script look like a new operator step. It
+#    blocked a pull request over two local variables. A gate that cries wolf gets
+#    switched off, which costs you the case it was built for.
+new_envs=$(awk '
+  /^\+\+\+ b\// { file = substr($0, 7); next }
+  /^\+[A-Z][A-Z0-9_]*=/ {
+    if (file ~ /env/ && file ~ /(example|sample|dist|template)/) {
+      split(substr($0, 2), parts, "=")
+      print parts[1]
+    }
+  }
+' <<<"$diff" | sort -u)
+if [[ -n "$new_envs" ]]; then
+  missing=""
+  while IFS= read -r v; do
+    [[ -z "$v" ]] && continue
+    grep -q "$v" <<<"$body" || missing+="$v "
+  done <<<"$new_envs"
+  if [[ -n "$missing" ]]; then
+    echo "BLOCKED: ${REPO}#${PR} adds environment variable(s) the body never mentions: ${missing}"
+    note "an operator step nobody wrote down is one nobody does"
+    fail=1
+  fi
+fi
+
+# 3. Migrations are the other classic silent step.
+#
+# This check used to be a bare `grep -qi 'migrat'` against the body, and it
+# passed a pull request that added a migration whose body read: "Nothing, no new
+# environment variables, migrations or manual steps detected in this diff."
+# The word "migrations" appears, so the gate was satisfied by the sentence
+# DENYING the migration existed. A gate whose failure looks like a pass is worse
+# than no gate, because a red result gets investigated and a green one closes
+# the question.
+#
+# The rule is now affirmative: every added migration must be NAMED in the body.
+# A denial cannot contain the filename, and an operator reading the plan learns
+# which migration is coming, which is what the section exists to tell them.
+#
+# Match with grep -E, then use sed only to strip the prefix. BSD sed has no \|
+# alternation, so a sed-only version of this silently matches nothing on macOS,
+# which would recreate the exact always-passes bug the check exists to fix.
+mig_files=$(grep -E '^\+\+\+ b/.*(migrations?/|/migrate/).*\.(py|sql|php|rb|js|ts)$' <<<"$diff" | sed 's|^+++ b/||')
+if [[ -n "$mig_files" ]]; then
+  missing_migs=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    base="${f##*/}"
+    stem="${base%.*}"
+    grep -qF "$base" <<<"$body" || grep -qF "$stem" <<<"$body" || missing_migs+="$base "
+  done <<<"$mig_files"
+  if [[ -n "$missing_migs" ]]; then
+    echo "BLOCKED: ${REPO}#${PR} adds migration(s) the body never names: ${missing_migs}"
+    note "naming it IS the check. A body saying 'no migrations' also contains the word 'migrations'."
+    fail=1
+  fi
+fi
+
+if [[ $fail -eq 0 ]]; then
+  if [[ $requires -eq 1 ]]; then
+    echo "ok ${REPO}#${PR}: release plan present, no undocumented operator steps."
+  else
+    echo "ok ${REPO}#${PR}: no undocumented operator steps (repo does not require a release-plan section)."
+  fi
+fi
+exit $fail
